@@ -1,0 +1,32 @@
+# PlatformIO build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# VSCode auto-generated
+.vscode/.browse.c_cpp.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch/
+.vscode/settings.json
+
+# Claude Code session state
+.claude/
+
+# Codex / other AI tool state
+.codex/
+.cursor/
+
+# macOS
+.DS_Store
+._*
+
+# Editor temp/swap
+*.swp
+*.swo
+*~
+.idea/
+
+# Local logs
+*.log
+mouse_logs.txt
