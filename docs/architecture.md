@@ -51,7 +51,7 @@ flowchart TB
   q1{{g_kvm_event_queue}}
   q2{{g_mouse_report_queue}}
   state[(kvm_state_t)]
-  conn[(s_conn_handle[2]<br/>s_hid_subscriber_conn[2]<br/>s_desired_slot)]
+  conn[(s_conn_handle x2<br/>s_hid_subscriber_conn x2<br/>s_desired_slot)]
 
   btn -- KVM_EVENT_BUTTON_* --> q1
   btn -- KVM_EVENT_PAIR_* --> q1
