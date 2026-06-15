@@ -27,6 +27,9 @@
 *~
 .idea/
 
+# Rust (companion app)
+companion/target/
+
 # Local logs
 *.log
 mouse_logs.txt

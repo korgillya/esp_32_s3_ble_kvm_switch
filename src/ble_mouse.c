@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "app_queues.h"
+#include "ble_control.h"
 #include "esp_hid_common.h"
 #include "esp_hidd.h"
 #include "esp_log.h"
@@ -27,15 +28,25 @@ static const char *TAG = "ble-mouse";
 #define BLE_ADV_CHANNEL_ALL 0x07
 #define SLOT_NONE (-1)
 #define PAIR_FAIL_BAILOUT 10
+#define BROADCAST_DURATION_MS 2000
 
 static esp_hidd_dev_t *s_hid_dev;
 static bool s_started;
 static bool s_advertising;
 static bool s_pairing_mode;
+static bool s_advertising_broadcast;
 static int s_advertising_for_slot = SLOT_NONE;
 
 static uint16_t s_conn_handle[2] = {BLE_HS_CONN_HANDLE_NONE, BLE_HS_CONN_HANDLE_NONE};
 static bool s_secure[2] = {false, false};
+
+/* The conn_handle that subscribed to the HID Input Report characteristic for
+ * this slot. May differ from s_conn_handle[] when a companion app opens a
+ * second BLE connection (e.g. macOS CoreBluetooth creates a separate conn
+ * from a scan-discovered peripheral on top of the existing HID-paired one).
+ * Mouse reports must go to this conn, not the latest-resolved one. */
+static uint16_t s_hid_subscriber_conn[2] = {BLE_HS_CONN_HANDLE_NONE,
+                                            BLE_HS_CONN_HANDLE_NONE};
 
 static uint16_t s_pending_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static int s_pending_conn_slot = SLOT_NONE;
@@ -179,6 +190,9 @@ static int ble_mouse_gap_event(struct ble_gap_event *event, void *arg)
         if (slot != SLOT_NONE) {
             s_conn_handle[slot] = BLE_HS_CONN_HANDLE_NONE;
             s_secure[slot] = false;
+            if (s_hid_subscriber_conn[slot] == conn) {
+                s_hid_subscriber_conn[slot] = BLE_HS_CONN_HANDLE_NONE;
+            }
             notify_slot = (kvm_host_t)slot;
         } else if (s_pending_conn_handle == conn) {
             if (s_pending_conn_slot != SLOT_NONE) {
@@ -256,15 +270,19 @@ static int ble_mouse_gap_event(struct ble_gap_event *event, void *arg)
             return 0;
         }
 
+        /* A single peer may open multiple BLE connections to us (e.g. macOS
+         * CoreBluetooth creates a separate conn for a user-space app while
+         * the system HID stack already holds one). Allow this — keep the
+         * latest conn here for slot-level operations (terminate, etc.), but
+         * mouse reports are routed via s_hid_subscriber_conn[]. */
         if (s_conn_handle[resolved] != BLE_HS_CONN_HANDLE_NONE &&
             s_conn_handle[resolved] != event->enc_change.conn_handle) {
-            ESP_LOGW(TAG,
-                     "slot %s already has another connection; dropping duplicate conn=%u",
-                     kvm_host_name(resolved), event->enc_change.conn_handle);
-            ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-            return 0;
+            ESP_LOGI(TAG,
+                     "slot %s already had conn %u; adding second conn %u",
+                     kvm_host_name(resolved),
+                     s_conn_handle[resolved],
+                     event->enc_change.conn_handle);
         }
-
         s_conn_handle[resolved] = event->enc_change.conn_handle;
         s_secure[resolved] = true;
         if (s_pending_conn_handle == event->enc_change.conn_handle) {
@@ -285,10 +303,27 @@ static int ble_mouse_gap_event(struct ble_gap_event *event, void *arg)
                  event->subscribe.attr_handle,
                  event->subscribe.cur_notify,
                  event->subscribe.cur_indicate);
-        if (event->subscribe.cur_notify &&
-            event->subscribe.attr_handle > s_hid_report_attr) {
+        /* Capture HID Input Report attr handle on the FIRST notify-subscribe
+         * we see. The OS HID stack subscribes to it immediately after pairing
+         * (well before any companion app could subscribe to our custom
+         * characteristics, whose handles are higher). Updating to a higher
+         * handle later would mis-route mouse reports onto warp_cmd. */
+        if (event->subscribe.cur_notify && s_hid_report_attr == 0) {
             s_hid_report_attr = event->subscribe.attr_handle;
             ESP_LOGI(TAG, "HID report attr captured: %u", s_hid_report_attr);
+        }
+        /* Remember which conn subscribed to the HID Report attribute. That
+         * is the OS HID stack — separate from any companion conn on the
+         * same peer that subscribes to other characteristics (warp_cmd). */
+        if (event->subscribe.cur_notify && s_hid_report_attr != 0 &&
+            event->subscribe.attr_handle == s_hid_report_attr) {
+            const int slot = find_slot_by_conn(event->subscribe.conn_handle);
+            if (slot != SLOT_NONE) {
+                s_hid_subscriber_conn[slot] = event->subscribe.conn_handle;
+                ESP_LOGI(TAG, "HID subscriber for slot %s = conn %u",
+                         kvm_host_name((kvm_host_t)slot),
+                         event->subscribe.conn_handle);
+            }
         }
         return 0;
     }
@@ -328,6 +363,66 @@ static int ble_mouse_gap_event(struct ble_gap_event *event, void *arg)
         }
         return 0;
     }
+    return 0;
+}
+
+/* Continue advertising even when both slots are connected, but in
+ * non-connectable mode. This lets a companion app on the active host's BT
+ * stack discover us through a service-UUID-filtered scan, without occupying
+ * a connection slot. The OS already owns a BLE connection to this peripheral
+ * identity, so the companion's CoreBluetooth peripheral.connect() resolves to
+ * that existing connection rather than opening a new one. */
+static int start_broadcast_for(kvm_host_t slot)
+{
+    int rc = ble_gap_adv_stop();
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "ble_gap_adv_stop rc=%d (broadcast)", rc);
+    }
+
+    ble_addr_t identity;
+    if (kvm_slots_ensure_identity(slot, &identity) != ESP_OK) {
+        return -1;
+    }
+    rc = ble_hs_id_set_rnd(identity.val);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "ble_hs_id_set_rnd rc=%d (broadcast)", rc);
+    }
+    ble_gap_wl_set(NULL, 0);
+
+    /* For non-connectable advertising NimBLE uses ADV_NONCONN_IND which does
+     * not solicit a scan response. Put the KVM service UUID in the adv data
+     * itself (and skip the device name to keep the 31-byte budget). */
+    struct ble_hs_adv_fields fields = {0};
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.uuids128 = &BLE_KVM_CONTROL_SVC_UUID;
+    fields.num_uuids128 = 1;
+    fields.uuids128_is_complete = 1;
+    rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "broadcast adv_set_fields rc=%d", rc);
+        return rc;
+    }
+
+    struct ble_gap_adv_params adv_params = {0};
+    adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    adv_params.channel_map = BLE_ADV_CHANNEL_ALL;
+    adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(100);
+    adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(200);
+    adv_params.filter_policy = BLE_HCI_ADV_FILT_NONE;
+
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
+                           &adv_params, ble_mouse_gap_event, NULL);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "broadcast adv_start rc=%d", rc);
+        return rc;
+    }
+
+    s_advertising = true;
+    s_pairing_mode = false;
+    s_advertising_broadcast = true;
+    s_advertising_for_slot = (int)slot;
+    ESP_LOGI(TAG, "BROADCAST for slot %s identity", kvm_host_name(slot));
     return 0;
 }
 
@@ -380,14 +475,30 @@ static int start_advertising_for(kvm_host_t slot, bool pairing)
         return rc;
     }
 
+    /* Scan response carries the 128-bit KVM Control service UUID so that
+     * companion apps can find this device using a service-UUID-filtered scan
+     * (on macOS that also returns already-bonded peripherals). */
+    struct ble_hs_adv_fields rsp_fields = {0};
+    rsp_fields.uuids128 = &BLE_KVM_CONTROL_SVC_UUID;
+    rsp_fields.num_uuids128 = 1;
+    rsp_fields.uuids128_is_complete = 1;
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "ble_gap_adv_rsp_set_fields rc=%d", rc);
+    }
+
     struct ble_gap_adv_params adv_params = {0};
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
     adv_params.channel_map = BLE_ADV_CHANNEL_ALL;
     adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(30);
     adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(60);
+    /* Filter only connect requests, not scan requests. This way only the
+     * bonded peer of this slot can establish a link, but any scanner (e.g.
+     * a companion app whose CoreBluetooth scan uses a different RPA) can
+     * still receive the scan response with our service UUID. */
     adv_params.filter_policy = (!pairing && has_bond)
-                                   ? BLE_HCI_ADV_FILT_BOTH
+                                   ? BLE_HCI_ADV_FILT_CONN
                                    : BLE_HCI_ADV_FILT_NONE;
 
     rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
@@ -399,6 +510,7 @@ static int start_advertising_for(kvm_host_t slot, bool pairing)
 
     s_advertising = true;
     s_pairing_mode = pairing;
+    s_advertising_broadcast = false;
     s_advertising_for_slot = (int)slot;
     ESP_LOGI(TAG,
              "%s for slot %s: identity %02X:%02X:%02X:%02X:%02X:%02X",
@@ -442,17 +554,19 @@ static void update_advertising(void)
     }
 
     if (target_slot == SLOT_NONE) {
-        int rc = ble_gap_adv_stop();
-        if (rc != 0 && rc != BLE_HS_EALREADY) {
-            ESP_LOGW(TAG, "ble_gap_adv_stop rc=%d", rc);
+        /* No connectable slot to advertise for. Run non-connectable broadcast
+         * on the desired slot's identity so the companion app can discover
+         * us through the OS BLE central. */
+        if (s_advertising && s_advertising_broadcast &&
+            s_advertising_for_slot == (int)s_desired_slot) {
+            return;
         }
-        s_advertising = false;
-        s_pairing_mode = false;
-        s_advertising_for_slot = SLOT_NONE;
+        start_broadcast_for(s_desired_slot);
         return;
     }
 
-    if (s_advertising && s_advertising_for_slot == target_slot &&
+    if (s_advertising && !s_advertising_broadcast &&
+        s_advertising_for_slot == target_slot &&
         s_pairing_mode == pairing) {
         return;
     }
@@ -542,6 +656,12 @@ esp_err_t ble_mouse_start(void)
         return ret;
     }
 
+    ret = ble_control_register();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ble_control_register failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
     ret = esp_nimble_enable(ble_mouse_host_task);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_nimble_enable failed: %s", esp_err_to_name(ret));
@@ -607,7 +727,10 @@ esp_err_t ble_mouse_send_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wh
     if (s_hid_report_attr == 0) {
         return ESP_ERR_INVALID_STATE;
     }
-    const uint16_t conn = s_conn_handle[s_desired_slot];
+    /* Send to the conn that subscribed to the HID Input Report, not the
+     * generic slot conn — they may differ when a companion app holds a
+     * second BLE link on the same peer. */
+    const uint16_t conn = s_hid_subscriber_conn[s_desired_slot];
     if (conn == BLE_HS_CONN_HANDLE_NONE || !s_secure[s_desired_slot]) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -628,7 +751,7 @@ esp_err_t ble_mouse_send_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wh
 
 bool ble_mouse_is_connected(void)
 {
-    return s_conn_handle[s_desired_slot] != BLE_HS_CONN_HANDLE_NONE &&
+    return s_hid_subscriber_conn[s_desired_slot] != BLE_HS_CONN_HANDLE_NONE &&
            s_secure[s_desired_slot];
 }
 
@@ -640,4 +763,33 @@ bool ble_mouse_is_advertising(void)
 bool ble_mouse_is_pairing(void)
 {
     return s_advertising && s_pairing_mode;
+}
+
+bool ble_mouse_slot_for_conn(uint16_t conn_handle, kvm_host_t *out_slot)
+{
+    const int slot = find_slot_by_conn(conn_handle);
+    if (slot == SLOT_NONE) {
+        return false;
+    }
+    *out_slot = (kvm_host_t)slot;
+    return true;
+}
+
+uint16_t ble_mouse_conn_for_slot(kvm_host_t slot)
+{
+    if (!s_secure[slot]) {
+        return BLE_HS_CONN_HANDLE_NONE;
+    }
+    return s_conn_handle[slot];
+}
+
+void ble_mouse_force_select(kvm_host_t slot)
+{
+    /* Push the same event the manual button path uses; kvm_state_handle_event
+     * will then update active_host, LEDs, buzzer, NVS-persisted active slot,
+     * and call back into ble_mouse_select_host to update advertising. */
+    const kvm_event_type_t ev = (slot == KVM_HOST_LEFT)
+                                    ? KVM_EVENT_GATT_SWITCH_TO_LEFT
+                                    : KVM_EVENT_GATT_SWITCH_TO_RIGHT;
+    post_ble_event(ev, slot);
 }

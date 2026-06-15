@@ -1,0 +1,32 @@
+[package]
+name = "esp32-kvm-companion"
+version = "0.1.0"
+edition = "2021"
+description = "Companion daemon that reports edge crossings and warps the cursor for the ESP32-S3 BLE KVM switch."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+bluest = "0.6"
+tokio = { version = "1", features = ["macros", "rt", "time", "signal", "sync"] }
+futures = "0.3"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = "=1.11"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# This crate is kept out of the firmware PlatformIO workspace; it builds with
+# its own `cargo build` from the companion/ directory. See companion/README.md.
