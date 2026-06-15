@@ -303,15 +303,8 @@ static int ble_mouse_gap_event(struct ble_gap_event *event, void *arg)
                  event->subscribe.attr_handle,
                  event->subscribe.cur_notify,
                  event->subscribe.cur_indicate);
-        /* Capture HID Input Report attr handle on the FIRST notify-subscribe
-         * we see. The OS HID stack subscribes to it immediately after pairing
-         * (well before any companion app could subscribe to our custom
-         * characteristics, whose handles are higher). Updating to a higher
-         * handle later would mis-route mouse reports onto warp_cmd. */
-        if (event->subscribe.cur_notify && s_hid_report_attr == 0) {
-            s_hid_report_attr = event->subscribe.attr_handle;
-            ESP_LOGI(TAG, "HID report attr captured: %u", s_hid_report_attr);
-        }
+        /* s_hid_report_attr is resolved up-front in ble_mouse_on_sync via
+         * ble_gatts_find_chr; no observation-based capture here. */
         /* Remember which conn subscribed to the HID Report attribute. That
          * is the OS HID stack — separate from any companion conn on the
          * same peer that subscribes to other characteristics (warp_cmd). */
@@ -578,6 +571,24 @@ static void ble_mouse_on_sync(void)
 {
     ble_svc_gap_device_name_set(BLE_MOUSE_NAME);
     ble_svc_gap_device_appearance_set(ESP_HID_APPEARANCE_MOUSE);
+
+    /* Resolve HID Input Report (UUID 0x2A4D) attribute handle directly from
+     * the GATT DB. We can't rely on observing it via BLE_GAP_EVENT_SUBSCRIBE
+     * because different OS HID stacks subscribe in different orders (macOS
+     * goes HID-first; Windows often hits Battery Service first), and the
+     * battery handle (~18) would be mistakenly captured as the mouse-report
+     * attr, breaking HID delivery. */
+    const ble_uuid_t *hid_svc = BLE_UUID16_DECLARE(BLE_HID_SERVICE_UUID);
+    const ble_uuid_t *hid_report = BLE_UUID16_DECLARE(0x2A4D);
+    uint16_t def_handle = 0, val_handle = 0;
+    int rc = ble_gatts_find_chr(hid_svc, hid_report, &def_handle, &val_handle);
+    if (rc == 0 && val_handle != 0) {
+        s_hid_report_attr = val_handle;
+        ESP_LOGI(TAG, "HID Input Report attr resolved from GATT DB: %u",
+                 val_handle);
+    } else {
+        ESP_LOGW(TAG, "ble_gatts_find_chr(HID Input Report) rc=%d", rc);
+    }
 }
 
 static void ble_mouse_host_task(void *param)

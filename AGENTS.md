@@ -42,9 +42,15 @@ NimBLE bond store keys bonds by **peer** address, not local address, so reconnec
 
 The reason for the explicit `s_hid_subscriber_conn[]` (separate from `s_conn_handle[]`) is that the same peer can hold **two BLE connections** to ESP at once: one used by the system HID stack and one opened by the companion app from a scan-discovered peripheral. Mouse reports must keep flowing to the HID-subscribing conn even after the companion's conn shows up on the same slot.
 
-### HID Report attribute is captured ONCE
+### HID Report attribute is resolved from the GATT DB, not from subscribe events
 
-`s_hid_report_attr` is set on the **first** notify-subscribe seen after the GATT DB starts (which is always the OS HID stack subscribing to HID Input Report). An earlier "largest handle wins" heuristic broke once the companion added a custom characteristic whose handle was higher than HID Report — mouse reports started going to `warp_cmd` instead. Do not change to a greedy or last-write-wins approach without filtering by characteristic UUID.
+`s_hid_report_attr` is set in `ble_mouse_on_sync` by calling `ble_gatts_find_chr(HID_SVC, 0x2A4D, ...)` once after NimBLE sync. The earlier approach (capture the first notify-subscribe; or "largest handle wins") was fragile:
+
+- macOS subscribes to HID Input Report first → "first wins" worked accidentally.
+- Windows subscribes to Battery Service first (attr handle ~18) → "first wins" captured the wrong handle and `send_report` started notifying battery instead of HID, so mouse stopped reaching the host.
+- Companion subscribing to `warp_cmd` (UUID-custom, handle higher than HID Report) → "largest handle wins" was also broken.
+
+Looking up the handle by UUID at boot dodges all of that. Keep it that way; the SUBSCRIBE handler still uses `s_hid_report_attr` to decide which conn is the "HID-subscriber" for `s_hid_subscriber_conn[]`, but does not overwrite `s_hid_report_attr` itself.
 
 ### Slot mapping is independent of NimBLE bond store
 
@@ -123,7 +129,7 @@ companion/
 - Don't use a single shared identity for both slots.
 - Don't clear the whole NimBLE bond store on long-press.
 - Don't bring back the GPIO press-edge ISR for buttons.
-- Don't update `s_hid_report_attr` with anything other than the first observed notify-subscribe.
+- Don't compute `s_hid_report_attr` from observation of `BLE_GAP_EVENT_SUBSCRIBE` — different OSes subscribe in different orders. Resolve it via `ble_gatts_find_chr` at on_sync.
 - Don't run companion on a multi-threaded tokio runtime — see macOS quirks above.
 - Don't drop the `Box::leak` on companion characteristics until bluest's lifetime story for `notify()` and `write_without_response` changes.
 

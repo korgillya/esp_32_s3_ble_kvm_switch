@@ -11,8 +11,7 @@ Built on ESP-IDF + NimBLE (firmware, PlatformIO) and Rust with `bluest` (compani
 - **Bond-isolated pairing**: long-press LEFT/RIGHT only touches that slot's bond.
 - **NVS persistence**: bond keys, identity addresses, last-active slot survive resets.
 - **OLED status display** + LEDs + buzzer feedback.
-- **Auto edge-switching (macOS)** ✅ — companion app on macOS detects cursor at screen edge, writes to ESP's custom KVM Control GATT service, ESP flips active slot and notifies the new host's companion to warp the cursor.
-- **Auto edge-switching (Windows)** — same companion crate, untested on Windows yet.
+- **Auto edge-switching (macOS + Windows)** ✅ — companion app detects cursor at screen edge, writes to ESP's custom KVM Control GATT service, ESP flips active slot and notifies the new host's companion to warp the cursor.
 
 ## Hardware Pinout
 
@@ -125,12 +124,11 @@ pio run -t erase && pio run -t upload
 4. ~~Bridge: route USB mouse reports to the selected BLE host~~ ✅
 5. ~~Dual-host mode: pair and switch between two laptops~~ ✅
 6. ~~Dual-connection mode: instant switching via per-conn notify routing~~ ✅
-7. ~~Custom GATT service + companion app + auto edge-switching (macOS)~~ ✅
-8. **Validate companion on Windows** — same code, untested.
-9. Configurable physical layout (which slot is the left monitor).
-10. Multi-monitor support per host.
-11. Vertical edge adjacency (top/bottom).
-12. Pre-built companion binaries + launchd / Windows Service autostart.
+7. ~~Custom GATT service + companion app + auto edge-switching (macOS + Windows)~~ ✅
+8. Configurable physical layout (which slot is the left monitor).
+9. Multi-monitor support per host.
+10. Vertical edge adjacency (top/bottom).
+11. Pre-built companion binaries + launchd / Windows Service autostart.
 
 ## Memory / build size
 
