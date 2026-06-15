@@ -1,13 +1,16 @@
 //! BLE client for the KVM Control GATT service via `bluest`.
 //!
-//! bluest is used (instead of btleplug) because on macOS it exposes
+//! `bluest` is used (instead of `btleplug`) because on macOS it exposes
 //! `Adapter::connected_devices_with_services`, which wraps Apple's
 //! `retrieveConnectedPeripherals(withServices:)`. That's the only API path
 //! that returns peripherals already bonded and connected via the system HID
 //! stack — a plain `scanForPeripherals` callback filters them out for
 //! user-space apps.
 //!
-//! UUIDs and wire format must match `docs/gatt-contract.md`.
+//! UUIDs and wire format must match `docs/gatt-contract.md`. The macOS
+//! quirks (handle refresh, `Box::leak` on characteristics, single-thread
+//! runtime, keepalive reconnect) are documented in `../../AGENTS.md` —
+//! don't strip them without re-testing on macOS.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,25 +18,30 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use bluest::{Adapter, Characteristic, Device, Service, Uuid};
-use futures::stream::{BoxStream, Stream};
+use futures::stream::Stream;
 use futures_util::StreamExt;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::cursor;
 
-/// Base UUID: 6b766d63-6f6e-7472-6f6c-000000000XXX (see docs/gatt-contract.md).
+/// KVM Control service UUID (`6b766d63-6f6e-7472-6f6c-000000000001`).
 pub const SVC_UUID: Uuid = Uuid::from_u128(0x6b766d63_6f6e_7472_6f6c_000000000001);
+/// Characteristic UUID for `slot_id` (read-only, 1 byte).
 pub const CHR_SLOT_ID: Uuid = Uuid::from_u128(0x6b766d63_6f6e_7472_6f6c_000000000002);
+/// Characteristic UUID for `edge_event` (write, 3 bytes).
 pub const CHR_EDGE_EVENT: Uuid = Uuid::from_u128(0x6b766d63_6f6e_7472_6f6c_000000000003);
+/// Characteristic UUID for `warp_cmd` (notify, 3 bytes).
 pub const CHR_WARP_CMD: Uuid = Uuid::from_u128(0x6b766d63_6f6e_7472_6f6c_000000000004);
 
 /// BLE HID service (0x1812) expanded into the Bluetooth base 128-bit UUID.
-/// We use this to ask macOS "which peripherals are HID-connected?" — those
-/// already have their HID services cached by the OS, so the call succeeds
-/// even when our custom KVM Control service hasn't yet been discovered.
+///
+/// Used to ask macOS "which peripherals are HID-connected?" — those already
+/// have their HID services cached by the OS, so the call succeeds even when
+/// our custom KVM Control service hasn't yet been discovered.
 pub const HID_SVC_UUID: Uuid = Uuid::from_u128(0x0000_1812_0000_1000_8000_00805f9b34fb);
 
+/// Which KVM slot this companion instance represents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {
     Left = 0,
@@ -41,6 +49,7 @@ pub enum Slot {
 }
 
 impl Slot {
+    /// Decode the byte returned by the firmware's `slot_id` characteristic.
     pub fn from_byte(b: u8) -> Result<Self> {
         match b {
             0 => Ok(Slot::Left),
@@ -50,6 +59,7 @@ impl Slot {
     }
 }
 
+/// Outbound edge crossing code, matches the firmware's `EDGE_CODE_*` macros.
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)] // Top/Bottom reserved for vertical layouts (v2)
 pub enum EdgeCode {
@@ -59,6 +69,7 @@ pub enum EdgeCode {
     Bottom = 4,
 }
 
+/// Inbound entry-side code carried by a `warp_cmd` notification.
 #[derive(Clone, Copy, Debug)]
 pub enum EntrySide {
     FromLeft = 1,
@@ -79,27 +90,38 @@ impl EntrySide {
     }
 }
 
-/// Resolved characteristic handles + slot id for an active session.
+/// Live GATT session against the ESP peripheral.
+///
+/// Returned from [`connect`] together with a [`WarpStream`] of inbound
+/// notifications. The fields below need to stay alive for as long as
+/// the daemon wants to issue GATT operations.
 #[derive(Clone)]
 pub struct Session {
     /// Held to keep the connection alive while we use its characteristics.
     #[allow(dead_code)]
     pub device: Arc<Device>,
-    /// Held alive so that `Characteristic` handles remain valid for notify/write
-    /// operations. Dropping the parent `Service` invalidates its characteristics
-    /// in bluest's internal cache.
+    /// Held alive so that `Characteristic` handles remain valid for
+    /// notify/write. Dropping the parent `Service` invalidates its
+    /// characteristics in bluest's internal cache.
     #[allow(dead_code)]
     pub service: Arc<Service>,
+    /// Which laptop this companion represents (read from the firmware once
+    /// per startup).
     pub slot: Slot,
-    /// Leaked into 'static so that GATT operations on this characteristic do
-    /// not run into bluest's `device isn't connected` error path that fires
-    /// when internal weak references to the peripheral are dropped between
-    /// `connect()` returning and the operation being awaited.
+    /// Leaked into `'static` to avoid bluest's "device isn't connected" error
+    /// path on subsequent writes — see the module-level doc comment.
     pub edge_event_chr: &'static Characteristic,
 }
 
+/// Pinned, boxed stream of inbound `warp_cmd` notifications.
 pub type WarpStream = Pin<Box<dyn Stream<Item = std::result::Result<Vec<u8>, bluest::Error>> + Send>>;
 
+/// Scan for the ESP peripheral, connect to it, resolve our custom KVM
+/// Control characteristics, subscribe to `warp_cmd`, and return everything
+/// the main loop needs.
+///
+/// The returned [`Adapter`] is used by [`ensure_connected`] for keepalive
+/// reconnects.
 pub async fn connect(device_name: &str) -> Result<(Session, WarpStream, Adapter)> {
     let adapter = Adapter::default()
         .await
@@ -191,10 +213,12 @@ pub async fn connect(device_name: &str) -> Result<(Session, WarpStream, Adapter)
     Ok((session, warp_stream, adapter))
 }
 
-/// Periodically called from main loop. Re-issues `connect_device` if bluest
-/// reports the device as disconnected, so that subsequent GATT operations
-/// have a live link. On macOS this also seems to keep CoreBluetooth from
-/// putting the link into a power-saving state that fails write operations.
+/// Periodic keepalive called from the main loop.
+///
+/// Re-issues `connect_device` if bluest reports the device as disconnected,
+/// so that subsequent GATT operations have a live link. On macOS this also
+/// keeps CoreBluetooth from putting the link into a power-saving state that
+/// would fail `write_without_response`.
 pub async fn ensure_connected(adapter: &Adapter, session: &Session) {
     let is_connected = session.device.is_connected().await;
     if !is_connected {
@@ -301,6 +325,12 @@ fn find_characteristic(
         .ok_or_else(|| anyhow!("{} characteristic missing on peripheral", label))
 }
 
+/// Push one edge crossing event to the firmware.
+///
+/// Writes 3 bytes (`edge_code`, `pos_norm_lo`, `pos_norm_hi`) to the
+/// `edge_event` characteristic. The firmware reacts by switching its active
+/// slot to the neighbouring host (if any) and notifying that host's
+/// companion via [`WarpStream`].
 pub async fn send_edge_event(
     session: &Session,
     code: EdgeCode,

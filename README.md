@@ -4,6 +4,10 @@ Firmware + companion app for an ESP32-S3 based BLE mouse KVM switch. The device 
 
 Built on ESP-IDF + NimBLE (firmware, PlatformIO) and Rust with `bluest` (companion daemon).
 
+📐 Visual walk-through of how the pieces fit together: [`docs/architecture.md`](docs/architecture.md) (renders Mermaid diagrams on GitHub).
+🔌 Custom GATT wire protocol: [`docs/gatt-contract.md`](docs/gatt-contract.md).
+🧠 Non-obvious design decisions and historical gotchas: [`AGENTS.md`](AGENTS.md).
+
 ## Status
 
 - **Manual switching** between two paired laptops via short-press button — sub-10 ms latency, both hosts stay connected simultaneously.
